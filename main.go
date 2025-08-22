@@ -59,10 +59,12 @@ type ScanResult struct {
 
 // FileItem represents a single file or directory
 type FileItem struct {
-	Path string
-	Size int64
-	Name string
-	Age  int // days old
+	Path     string
+	Size     int64
+	Name     string
+	Age      int // days old
+	IsDir    bool
+	Children []FileItem
 }
 
 // Scanner performs the file system scanning
@@ -75,7 +77,7 @@ type Scanner struct {
 // Model represents the application state
 type Model struct {
 	scanner        *Scanner
-	state          string // "menu", "scanning", "results", "cleaning", "diskusage"
+	state          string // "menu", "scanning", "results", "cleaning", "diskusage", "detail"
 	menuChoice     int
 	scanProgress   float64
 	scanMessage    string
@@ -90,6 +92,16 @@ type Model struct {
 	height         int
 	err            error
 	diskUsageTable table.Model
+	// Detail view fields
+	currentCategory string
+	currentPath     []string // breadcrumb path
+	detailItems     []FileItem
+	detailChoice    int
+	detailOffset    int // Scroll offset for detail view
+	// Scanning view fields
+	scanningPaths   []string // Recently scanned paths
+	scanFoundItems  int      // Number of items found
+	scanTotalSize   int64    // Total size found so far
 }
 
 // Messages
@@ -101,10 +113,14 @@ type scanCompleteMsg struct {
 type scanProgressMsg struct {
 	percent float64
 	message string
+	path    string
+	size    int64
+	found   int
 }
 
 type cleanCompleteMsg struct {
 	freed int64
+	path  string // Path of the cleaned item
 }
 
 type diskUsageMsg struct {
@@ -164,6 +180,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					)
 				case 1: // Dev Scan
 					m.state = "scanning"
+					m.scanMessage = "Starting Dev Scan - Deep scanning all projects..."
+					m.scanningPaths = []string{}
+					m.scanFoundItems = 0
+					m.scanTotalSize = 0
 					return m, tea.Batch(
 						m.spinner.Tick,
 						performDevScan(m.scanner),
@@ -185,12 +205,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = "menu"
 					m.menuChoice = 0
 				} else {
-					// Start cleaning selected category
-					m.state = "cleaning"
+					// Enter detail view for the selected category
 					categories := getSortedCategories(m.results)
 					if m.menuChoice < len(categories) {
 						category := categories[m.menuChoice]
-						return m, performClean(m.scanner, category)
+						m.currentCategory = category
+						m.currentPath = []string{category}
+						m.detailItems = m.results[category].Items
+						m.detailChoice = 0
+						m.detailOffset = 0
+						m.state = "detail"
+					}
+				}
+			case "detail":
+				if m.detailChoice < len(m.detailItems) {
+					item := m.detailItems[m.detailChoice]
+					if item.IsDir {
+						// Explore subdirectory
+						return m, exploreDirectory(&m, item.Path)
 					}
 				}
 			}
@@ -208,6 +240,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.diskUsageTable, cmd = m.diskUsageTable.Update(msg)
 				return m, cmd
+			} else if m.state == "detail" {
+				if m.detailChoice > 0 {
+					m.detailChoice--
+					// Adjust viewport if needed
+					if m.detailChoice < m.detailOffset {
+						m.detailOffset = m.detailChoice
+					}
+				}
 			}
 
 		case "down", "j":
@@ -223,12 +263,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.diskUsageTable, cmd = m.diskUsageTable.Update(msg)
 				return m, cmd
+			} else if m.state == "detail" {
+				if m.detailChoice < len(m.detailItems)-1 {
+					m.detailChoice++
+					// Adjust viewport if needed
+					viewportHeight := m.height - 15 // Account for header and footer
+					if m.detailChoice >= m.detailOffset+viewportHeight {
+						m.detailOffset = m.detailChoice - viewportHeight + 1
+					}
+				}
+			}
+			
+		case "pgup":
+			if m.state == "detail" {
+				viewportHeight := m.height - 15
+				m.detailChoice = max(0, m.detailChoice-viewportHeight)
+				m.detailOffset = max(0, m.detailOffset-viewportHeight)
+			}
+			
+		case "pgdown":
+			if m.state == "detail" {
+				viewportHeight := m.height - 15
+				maxChoice := len(m.detailItems) - 1
+				m.detailChoice = min(maxChoice, m.detailChoice+viewportHeight)
+				maxOffset := max(0, len(m.detailItems)-viewportHeight)
+				m.detailOffset = min(maxOffset, m.detailOffset+viewportHeight)
+			}
+
+		case "backspace", "delete":
+			if m.state == "detail" && len(m.currentPath) > 1 {
+				// Go back one level in detail view
+				m.currentPath = m.currentPath[:len(m.currentPath)-1]
+				if len(m.currentPath) == 1 {
+					// Back to category root
+					m.detailItems = m.results[m.currentCategory].Items
+				} else {
+					// Reload parent directory
+					return m, exploreDirectory(&m, filepath.Dir(m.detailItems[0].Path))
+				}
+				m.detailChoice = 0
+				m.detailOffset = 0
 			}
 
 		case "esc":
-			if m.state == "results" || m.state == "cleaning" || m.state == "diskusage" {
+			if m.state == "detail" {
+				m.state = "results"
+				m.detailChoice = 0
+			} else if m.state == "results" || m.state == "cleaning" || m.state == "diskusage" {
 				m.state = "menu"
 				m.menuChoice = 0
+			}
+			
+		case "c":
+			// Clean selected item in detail view
+			if m.state == "detail" && m.detailChoice < len(m.detailItems) {
+				item := m.detailItems[m.detailChoice]
+				m.state = "cleaning"
+				m.scanMessage = fmt.Sprintf("Cleaning %s...", item.Name)
+				return m, performCleanItem(m.scanner, item)
 			}
 		}
 
@@ -240,6 +332,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scanProgressMsg:
 		m.scanProgress = msg.percent
 		m.scanMessage = msg.message
+		if msg.path != "" {
+			// Add to scanning paths (keep last 10)
+			m.scanningPaths = append(m.scanningPaths, msg.path)
+			if len(m.scanningPaths) > 10 {
+				m.scanningPaths = m.scanningPaths[len(m.scanningPaths)-10:]
+			}
+			m.scanFoundItems = msg.found
+			m.scanTotalSize += msg.size
+		}
 		return m, nil
 
 	case scanCompleteMsg:
@@ -250,9 +351,58 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case cleanCompleteMsg:
-		// Remove cleaned items from results
-		m.totalSize -= msg.freed
-		m.state = "results"
+		if m.state == "cleaning" {
+			// If we were in detail view, refresh it
+			if msg.path != "" {
+				// Remove the deleted item from the list
+				newItems := []FileItem{}
+				for _, item := range m.detailItems {
+					if item.Path != msg.path {
+						newItems = append(newItems, item)
+					}
+				}
+				m.detailItems = newItems
+				
+				// Adjust selection if needed
+				if m.detailChoice >= len(m.detailItems) && len(m.detailItems) > 0 {
+					m.detailChoice = len(m.detailItems) - 1
+				}
+				if m.detailChoice < 0 {
+					m.detailChoice = 0
+				}
+				
+				// Adjust scroll offset if needed
+				if m.detailOffset > 0 && m.detailChoice < m.detailOffset {
+					m.detailOffset = m.detailChoice
+				}
+				
+				// Update the total size in results if this was from a category
+				if m.currentCategory != "" {
+					if result, exists := m.results[m.currentCategory]; exists {
+						// Update the category's items list
+						newCategoryItems := []FileItem{}
+						for _, item := range result.Items {
+							if item.Path != msg.path {
+								newCategoryItems = append(newCategoryItems, item)
+							}
+						}
+						result.Items = newCategoryItems
+						result.Total -= msg.freed
+					}
+				}
+				
+				m.totalSize -= msg.freed
+				m.state = "detail" // Return to detail view
+				
+				// Show success message briefly
+				deletedName := filepath.Base(msg.path)
+				m.scanMessage = fmt.Sprintf("✅ Deleted %s (%s)", deletedName, humanize.Bytes(uint64(msg.freed)))
+			} else {
+				// Regular cleaning from results view
+				m.totalSize -= msg.freed
+				m.state = "results"
+			}
+		}
 		return m, nil
 
 	case diskUsageMsg:
@@ -291,6 +441,8 @@ func (m Model) View() string {
 		content = m.renderCleaning()
 	case "diskusage":
 		content = m.renderDiskUsage()
+	case "detail":
+		content = m.renderDetail()
 	}
 
 	// Add horizontal padding
@@ -343,12 +495,49 @@ func (m Model) renderScanning() string {
 	var s strings.Builder
 
 	s.WriteString(headerStyle.Render("Scanning System..."))
-	s.WriteString("\n\n\n")
+	s.WriteString("\n\n")
+	
+	// Show scanning stats
+	if m.scanFoundItems > 0 {
+		stats := fmt.Sprintf("🔍 Found %d items | %s total",
+			m.scanFoundItems,
+			humanize.Bytes(uint64(m.scanTotalSize)))
+		s.WriteString("  " + successStyle.Render(stats))
+		s.WriteString("\n\n")
+	}
+	
 	s.WriteString("  " + m.spinner.View() + " " + m.scanMessage)
-	s.WriteString("\n\n\n")
-	s.WriteString(m.progress.ViewAs(m.scanProgress))
-	s.WriteString("\n\n\n")
-	s.WriteString(dimStyle.Render("Please wait, this may take a moment..."))
+	s.WriteString("\n\n")
+	
+	// Show recently scanned paths
+	if len(m.scanningPaths) > 0 {
+		s.WriteString("  " + dimStyle.Render("📁 Recently found:"))
+		s.WriteString("\n")
+		for _, path := range m.scanningPaths {
+			// Truncate long paths
+			displayPath := path
+			if len(path) > 60 {
+				displayPath = "..." + path[len(path)-57:]
+			}
+			s.WriteString("     " + dimStyle.Render(displayPath))
+			s.WriteString("\n")
+		}
+		s.WriteString("\n")
+	}
+	
+	// Show what we're looking for
+	if m.state == "scanning" && strings.Contains(m.scanMessage, "Dev") {
+		s.WriteString("  " + dimStyle.Render("🎯 Searching for:"))
+		s.WriteString("\n")
+		s.WriteString("  " + dimStyle.Render("   • node_modules, venv, __pycache__"))
+		s.WriteString("\n")
+		s.WriteString("  " + dimStyle.Render("   • build/dist folders, target directories"))
+		s.WriteString("\n")
+		s.WriteString("  " + dimStyle.Render("   • Package manager caches"))
+		s.WriteString("\n\n")
+	}
+	
+	s.WriteString(dimStyle.Render("Please wait, scanning your directories..."))
 
 	return s.String()
 }
@@ -409,7 +598,7 @@ func (m Model) renderResults() string {
 	s.WriteString("  " + cursor + style.Render("← Back to Menu") + "\n")
 
 	s.WriteString("\n\n")
-	s.WriteString(dimStyle.Render("Select a category to clean or press Esc to go back"))
+	s.WriteString(dimStyle.Render("Press Enter to explore category • ESC to go back to menu"))
 
 	return s.String()
 }
@@ -419,7 +608,11 @@ func (m Model) renderCleaning() string {
 
 	s.WriteString(headerStyle.Render("Cleaning Files..."))
 	s.WriteString("\n\n\n")
-	s.WriteString("  " + m.spinner.View() + " Removing selected files...")
+	if m.scanMessage != "" {
+		s.WriteString("  " + m.spinner.View() + " " + m.scanMessage)
+	} else {
+		s.WriteString("  " + m.spinner.View() + " Removing selected files...")
+	}
 	s.WriteString("\n\n\n")
 	s.WriteString(m.progress.ViewAs(m.cleanProgress))
 
@@ -436,6 +629,107 @@ func (m Model) renderDiskUsage() string {
 	s.WriteString(dimStyle.Render("Use ↑/↓ or j/k to navigate, ESC or q to go back to menu"))
 
 	return s.String()
+}
+
+func (m Model) renderDetail() string {
+	var s strings.Builder
+
+	// Breadcrumb navigation
+	breadcrumb := strings.Join(m.currentPath, " > ")
+	s.WriteString(headerStyle.Render("📁 " + breadcrumb))
+	s.WriteString("\n\n")
+	
+	// Show success message if item was just cleaned
+	if m.state == "detail" && strings.Contains(m.scanMessage, "✅") {
+		s.WriteString("  " + successStyle.Render(m.scanMessage))
+		s.WriteString("\n")
+	}
+	s.WriteString("\n")
+
+	if len(m.detailItems) == 0 {
+		s.WriteString("  " + dimStyle.Render("No items found"))
+		s.WriteString("\n\n")
+		s.WriteString(dimStyle.Render("Press Backspace to go back"))
+		return s.String()
+	}
+
+	// Calculate viewport
+	viewportHeight := m.height - 15 // Account for header, footer, and padding
+	if viewportHeight < 5 {
+		viewportHeight = 5 // Minimum viewport height
+	}
+
+	// Determine visible range
+	startIdx := m.detailOffset
+	endIdx := min(startIdx+viewportHeight, len(m.detailItems))
+
+	// Show scroll indicator if needed
+	if len(m.detailItems) > viewportHeight {
+		scrollInfo := fmt.Sprintf("[%d-%d of %d items]", startIdx+1, endIdx, len(m.detailItems))
+		s.WriteString("  " + dimStyle.Render(scrollInfo))
+		if startIdx > 0 {
+			s.WriteString(dimStyle.Render(" ↑"))
+		}
+		if endIdx < len(m.detailItems) {
+			s.WriteString(dimStyle.Render(" ↓"))
+		}
+		s.WriteString("\n\n")
+	}
+
+	// Display visible items
+	for i := startIdx; i < endIdx; i++ {
+		item := m.detailItems[i]
+		cursor := "  "
+		style := lipgloss.NewStyle()
+
+		if m.detailChoice == i {
+			cursor = "▸ "
+			style = selectedStyle
+		}
+
+		icon := "📄"
+		if item.IsDir {
+			icon = "📁"
+		}
+
+		// Adjust name width based on terminal width
+		nameWidth := min(50, m.width-30)
+		line := fmt.Sprintf("%s %-*s %10s",
+			icon,
+			nameWidth,
+			truncatePath(item.Name, nameWidth),
+			humanize.Bytes(uint64(item.Size)),
+		)
+
+		s.WriteString("  " + cursor + style.Render(line) + "\n")
+	}
+
+	// Fill remaining viewport space
+	remainingLines := viewportHeight - (endIdx - startIdx)
+	for i := 0; i < remainingLines && i < 3; i++ {
+		s.WriteString("\n")
+	}
+	
+	// Show total size for current view
+	var totalSize int64
+	for _, item := range m.detailItems {
+		totalSize += item.Size
+	}
+	s.WriteString("\n")
+	s.WriteString("  " + dimStyle.Render(fmt.Sprintf("Total: %s", humanize.Bytes(uint64(totalSize)))))
+	s.WriteString("\n\n")
+	
+	// Instructions
+	s.WriteString(dimStyle.Render("↑/↓ Navigate • PgUp/PgDn: Page • Enter: Open • Backspace: Up • c: Clean • ESC: Back"))
+
+	return s.String()
+}
+
+func truncatePath(path string, maxLen int) string {
+	if len(path) <= maxLen {
+		return path
+	}
+	return path[:maxLen-3] + "..."
 }
 
 func (m Model) getTotalItems() int {
@@ -496,9 +790,10 @@ func (s *Scanner) scanCacheFiles() *ScanResult {
 			size, _ := s.getDirSize(path)
 			if size > 0 {
 				result.Items = append(result.Items, FileItem{
-					Path: path,
-					Size: size,
-					Name: entry.Name(),
+					Path:  path,
+					Size:  size,
+					Name:  entry.Name(),
+					IsDir: true,
 				})
 				result.Total += size
 			}
@@ -688,68 +983,172 @@ func (s *Scanner) scanBrewCache() *ScanResult {
 	return result
 }
 
+func (s *Scanner) scanNodeModulesWithProgress(progressChan chan<- scanProgressMsg) *ScanResult {
+	result := &ScanResult{
+		Category: "Node Modules",
+		Items:    []FileItem{},
+	}
+
+	itemCount := 0
+	// Deep scan entire home directory
+	filepath.WalkDir(s.HomeDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			// Skip system directories
+			if strings.Contains(path, "/Library/") && !strings.Contains(path, "/Documents/") ||
+			   strings.Contains(path, "/System/") ||
+			   strings.Contains(path, "/.Trash/") ||
+			   strings.Contains(path, "/Applications/") && !strings.Contains(path, "/Documents/") {
+				return filepath.SkipDir
+			}
+
+			if d.Name() == "node_modules" {
+				size, _ := s.getDirSize(path)
+				if size > 0 {
+					// Get project path for better context
+					projectPath := filepath.Dir(path)
+					relPath, _ := filepath.Rel(s.HomeDir, projectPath)
+					item := FileItem{
+						Path:  path,
+						Size:  size,
+						Name:  fmt.Sprintf("📦 %s", relPath),
+						IsDir: true,
+					}
+					result.Items = append(result.Items, item)
+					result.Total += size
+					itemCount++
+					
+					// Send progress update
+					if progressChan != nil {
+						select {
+						case progressChan <- scanProgressMsg{
+							path:  relPath,
+							size:  size,
+							found: itemCount,
+							message: fmt.Sprintf("Found node_modules in %s", relPath),
+						}:
+						default:
+						}
+					}
+				}
+				return filepath.SkipDir
+			}
+		}
+
+		return nil
+	})
+
+	return result
+}
+
 func (s *Scanner) scanNodeModules() *ScanResult {
 	result := &ScanResult{
 		Category: "Node Modules",
 		Items:    []FileItem{},
 	}
 
-	searchDirs := []string{
-		filepath.Join(s.HomeDir, "Desktop"),
-		filepath.Join(s.HomeDir, "Documents"),
-		filepath.Join(s.HomeDir, "Developer"),
-		filepath.Join(s.HomeDir, "Projects"),
-	}
-
-	for _, dir := range searchDirs {
-		if _, err := os.Stat(dir); err != nil {
-			continue
+	// Deep scan entire home directory
+	filepath.WalkDir(s.HomeDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
 
-		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if d.IsDir() && d.Name() == "node_modules" {
-				size, _ := s.getDirSize(path)
-				if size > 0 {
-					parentDir := filepath.Base(filepath.Dir(path))
-					result.Items = append(result.Items, FileItem{
-						Path: path,
-						Size: size,
-						Name: fmt.Sprintf("node_modules in %s", parentDir),
-					})
-					result.Total += size
-				}
-				return filepath.SkipDir // Don't traverse inside node_modules
-			}
-
-			// Skip hidden directories and common non-project directories
-			if d.IsDir() && (strings.HasPrefix(d.Name(), ".") || d.Name() == "Library") {
+		if d.IsDir() {
+			// Skip system directories
+			if strings.Contains(path, "/Library/") && !strings.Contains(path, "/Documents/") ||
+			   strings.Contains(path, "/System/") ||
+			   strings.Contains(path, "/.Trash/") ||
+			   strings.Contains(path, "/Applications/") && !strings.Contains(path, "/Documents/") {
 				return filepath.SkipDir
 			}
 
-			return nil
-		})
-	}
+			if d.Name() == "node_modules" {
+				size, _ := s.getDirSize(path)
+				if size > 0 {
+					// Get project path for better context
+					projectPath := filepath.Dir(path)
+					relPath, _ := filepath.Rel(s.HomeDir, projectPath)
+					result.Items = append(result.Items, FileItem{
+						Path:  path,
+						Size:  size,
+						Name:  fmt.Sprintf("📦 %s", relPath),
+						IsDir: true,
+					})
+					result.Total += size
+				}
+				return filepath.SkipDir
+			}
+		}
+
+		return nil
+	})
 
 	return result
 }
 
 // Development-specific scanners
+func (s *Scanner) scanPythonArtifactsWithProgress(progressChan chan<- scanProgressMsg) *ScanResult {
+	result := s.scanPythonArtifacts()
+	// Send found items as progress
+	for _, item := range result.Items {
+		if progressChan != nil {
+			select {
+			case progressChan <- scanProgressMsg{
+				path:    item.Name,
+				size:    item.Size,
+				found:   len(result.Items),
+				message: "Scanning Python artifacts...",
+			}:
+			default:
+			}
+		}
+	}
+	return result
+}
+
+func (s *Scanner) scanRustArtifactsWithProgress(progressChan chan<- scanProgressMsg) *ScanResult {
+	result := s.scanRustArtifacts()
+	for _, item := range result.Items {
+		if progressChan != nil {
+			select {
+			case progressChan <- scanProgressMsg{
+				path:    item.Name,
+				size:    item.Size,
+				found:   len(result.Items),
+				message: "Scanning Rust artifacts...",
+			}:
+			default:
+			}
+		}
+	}
+	return result
+}
+
+func (s *Scanner) scanBuildArtifactsWithProgress(progressChan chan<- scanProgressMsg) *ScanResult {
+	result := s.scanBuildArtifacts()
+	for _, item := range result.Items {
+		if progressChan != nil {
+			select {
+			case progressChan <- scanProgressMsg{
+				path:    item.Name,
+				size:    item.Size,
+				found:   len(result.Items),
+				message: "Scanning build artifacts...",
+			}:
+			default:
+			}
+		}
+	}
+	return result
+}
+
 func (s *Scanner) scanPythonArtifacts() *ScanResult {
 	result := &ScanResult{
 		Category: "Python Artifacts",
 		Items:    []FileItem{},
-	}
-
-	searchDirs := []string{
-		filepath.Join(s.HomeDir, "Desktop"),
-		filepath.Join(s.HomeDir, "Documents"),
-		filepath.Join(s.HomeDir, "Developer"),
-		filepath.Join(s.HomeDir, "Projects"),
-		filepath.Join(s.HomeDir, "Code"),
 	}
 
 	// Python cache directories
@@ -774,43 +1173,43 @@ func (s *Scanner) scanPythonArtifacts() *ScanResult {
 		}
 	}
 
-	// Search for __pycache__, venv, .env directories
-	for _, dir := range searchDirs {
-		if _, err := os.Stat(dir); err != nil {
-			continue
+	// Deep scan for Python virtual environments and caches
+	filepath.WalkDir(s.HomeDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
 
-		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
+		if d.IsDir() {
+			// Skip system directories
+			if strings.Contains(path, "/Library/") && !strings.Contains(path, "/Documents/") ||
+			   strings.Contains(path, "/System/") ||
+			   strings.Contains(path, "/.Trash/") ||
+			   strings.Contains(path, "/Applications/") && !strings.Contains(path, "/Documents/") {
+				return filepath.SkipDir
 			}
 
-			if d.IsDir() {
-				name := d.Name()
-				if name == "__pycache__" || name == "venv" || name == ".venv" || 
-				   name == "env" || name == ".env" || name == "virtualenv" {
-					size, _ := s.getDirSize(path)
-					if size > 0 {
-						parentDir := filepath.Base(filepath.Dir(path))
-						result.Items = append(result.Items, FileItem{
-							Path: path,
-							Size: size,
-							Name: fmt.Sprintf("Python: %s in %s", name, parentDir),
-						})
-						result.Total += size
-					}
-					return filepath.SkipDir
+			name := d.Name()
+			if name == "__pycache__" || name == "venv" || name == ".venv" || 
+			   name == "env" || name == ".env" || name == "virtualenv" || 
+			   name == ".pytest_cache" || name == ".tox" || name == ".mypy_cache" {
+				size, _ := s.getDirSize(path)
+				if size > 0 {
+					projectPath := filepath.Dir(path)
+					relPath, _ := filepath.Rel(s.HomeDir, projectPath)
+					result.Items = append(result.Items, FileItem{
+						Path:  path,
+						Size:  size,
+						Name:  fmt.Sprintf("🐍 %s (%s)", relPath, name),
+						IsDir: true,
+					})
+					result.Total += size
 				}
-
-				// Skip hidden directories except .env/.venv
-				if strings.HasPrefix(name, ".") && name != ".env" && name != ".venv" {
-					return filepath.SkipDir
-				}
+				return filepath.SkipDir
 			}
+		}
 
-			return nil
-		})
-	}
+		return nil
+	})
 
 	return result
 }
@@ -867,56 +1266,52 @@ func (s *Scanner) scanRustArtifacts() *ScanResult {
 		size, _ := s.getDirSize(registryCache)
 		if size > 0 {
 			result.Items = append(result.Items, FileItem{
-				Path: registryCache,
-				Size: size,
-				Name: "Rust: Cargo registry cache",
+				Path:  registryCache,
+				Size:  size,
+				Name:  "🦀 Cargo registry cache",
+				IsDir: true,
 			})
 			result.Total += size
 		}
 	}
 
-	// Search for target directories in Rust projects
-	searchDirs := []string{
-		filepath.Join(s.HomeDir, "Desktop"),
-		filepath.Join(s.HomeDir, "Documents"),
-		filepath.Join(s.HomeDir, "Developer"),
-		filepath.Join(s.HomeDir, "Projects"),
-	}
-
-	for _, dir := range searchDirs {
-		if _, err := os.Stat(dir); err != nil {
-			continue
+	// Deep scan for Rust target directories
+	filepath.WalkDir(s.HomeDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
 
-		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
+		if d.IsDir() {
+			// Skip system directories
+			if strings.Contains(path, "/Library/") && !strings.Contains(path, "/Documents/") ||
+			   strings.Contains(path, "/System/") ||
+			   strings.Contains(path, "/.Trash/") ||
+			   strings.Contains(path, "/Applications/") && !strings.Contains(path, "/Documents/") {
+				return filepath.SkipDir
 			}
 
-			if d.IsDir() && d.Name() == "target" {
+			if d.Name() == "target" {
 				// Check if it's a Rust project (has Cargo.toml in parent)
 				if _, err := os.Stat(filepath.Join(filepath.Dir(path), "Cargo.toml")); err == nil {
 					size, _ := s.getDirSize(path)
 					if size > 0 {
-						parentDir := filepath.Base(filepath.Dir(path))
+						projectPath := filepath.Dir(path)
+						relPath, _ := filepath.Rel(s.HomeDir, projectPath)
 						result.Items = append(result.Items, FileItem{
-							Path: path,
-							Size: size,
-							Name: fmt.Sprintf("Rust: target in %s", parentDir),
+							Path:  path,
+							Size:  size,
+							Name:  fmt.Sprintf("🦀 %s", relPath),
+							IsDir: true,
 						})
 						result.Total += size
 					}
 					return filepath.SkipDir
 				}
 			}
+		}
 
-			if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
-				return filepath.SkipDir
-			}
-
-			return nil
-		})
-	}
+		return nil
+	})
 
 	return result
 }
@@ -1140,51 +1535,130 @@ func (s *Scanner) scanCocoaPods() *ScanResult {
 	return result
 }
 
+// Additional deep scan function for build artifacts
+func (s *Scanner) scanBuildArtifacts() *ScanResult {
+	result := &ScanResult{
+		Category: "Build Artifacts",
+		Items:    []FileItem{},
+	}
+
+	// Deep scan for various build directories
+	filepath.WalkDir(s.HomeDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			// Skip system directories
+			if strings.Contains(path, "/Library/") && !strings.Contains(path, "/Documents/") ||
+			   strings.Contains(path, "/System/") ||
+			   strings.Contains(path, "/.Trash/") ||
+			   strings.Contains(path, "/Applications/") && !strings.Contains(path, "/Documents/") {
+				return filepath.SkipDir
+			}
+
+			name := d.Name()
+			// Check for common build directories
+			if name == "dist" || name == "build" || name == "out" || 
+			   name == ".next" || name == ".nuxt" || name == ".output" ||
+			   name == "coverage" || name == ".nyc_output" || name == ".parcel-cache" ||
+			   name == "tmp" || name == "temp" {
+				// Check if it's likely a project build dir (has package.json, Cargo.toml, etc. in parent)
+				parentDir := filepath.Dir(path)
+				isProjectDir := false
+				
+				projectFiles := []string{"package.json", "Cargo.toml", "pom.xml", "build.gradle", "Makefile", "CMakeLists.txt"}
+				for _, pf := range projectFiles {
+					if _, err := os.Stat(filepath.Join(parentDir, pf)); err == nil {
+						isProjectDir = true
+						break
+					}
+				}
+				
+				if isProjectDir {
+					size, _ := s.getDirSize(path)
+					if size > 0 {
+						relPath, _ := filepath.Rel(s.HomeDir, parentDir)
+						result.Items = append(result.Items, FileItem{
+							Path:  path,
+							Size:  size,
+							Name:  fmt.Sprintf("🔨 %s (%s)", relPath, name),
+							IsDir: true,
+						})
+						result.Total += size
+					}
+					return filepath.SkipDir
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return result
+}
+
+// Channel for sending scan updates
+var scanUpdateChan chan scanProgressMsg
+
 // Command functions
 func performDevScan(scanner *Scanner) tea.Cmd {
 	return func() tea.Msg {
+		// Create a channel for live updates
+		scanUpdateChan = make(chan scanProgressMsg, 100)
+		
+		// Start a goroutine to send updates
+		go func() {
+			for _ = range scanUpdateChan {
+				// Updates are being handled by the channel
+			}
+		}()
+		
+		// Note: Deep scan operations run in parallel but may take longer
+		// due to traversing entire home directory
 		scanners := []struct {
 			name string
-			fn   func() *ScanResult
+			fn   func(chan<- scanProgressMsg) *ScanResult
 		}{
-			{"Node Modules", scanner.scanNodeModules},
-			{"NPM/Yarn/PNPM Caches", scanner.scanNpmYarnCaches},
-			{"Python Artifacts", scanner.scanPythonArtifacts},
-			{"Go Artifacts", scanner.scanGoArtifacts},
-			{"Rust Artifacts", scanner.scanRustArtifacts},
-			{"Java/JVM Artifacts", scanner.scanJavaArtifacts},
-			{"Ruby Artifacts", scanner.scanRubyArtifacts},
-			{"Docker Artifacts", scanner.scanDockerArtifacts},
-			{"IDE Caches", scanner.scanIDECaches},
-			{"Xcode Files", scanner.scanXcodeFiles},
-			{"Homebrew Cache", scanner.scanBrewCache},
-			{"CocoaPods", scanner.scanCocoaPods},
+			{"Node Modules", scanner.scanNodeModulesWithProgress},
+			{"Python Artifacts", scanner.scanPythonArtifactsWithProgress},
+			{"Rust Artifacts", scanner.scanRustArtifactsWithProgress},
+			{"Build Artifacts", scanner.scanBuildArtifactsWithProgress},
+			{"NPM/Yarn/PNPM Caches", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanNpmYarnCaches() }},
+			{"Go Artifacts", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanGoArtifacts() }},
+			{"Java/JVM Artifacts", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanJavaArtifacts() }},
+			{"Ruby Artifacts", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanRubyArtifacts() }},
+			{"Docker Artifacts", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanDockerArtifacts() }},
+			{"IDE Caches", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanIDECaches() }},
+			{"Xcode Files", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanXcodeFiles() }},
+			{"Homebrew Cache", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanBrewCache() }},
+			{"CocoaPods", func(ch chan<- scanProgressMsg) *ScanResult { return scanner.scanCocoaPods() }},
 		}
 
 		results := make(map[string]*ScanResult)
 		var totalSize int64
-		var completed int32
+		var totalFound int
 
 		// Use goroutines for parallel scanning
 		var wg sync.WaitGroup
 		for _, sc := range scanners {
 			wg.Add(1)
-			go func(name string, scanFunc func() *ScanResult) {
+			go func(name string, scanFunc func(chan<- scanProgressMsg) *ScanResult) {
 				defer wg.Done()
 
-				result := scanFunc()
+				result := scanFunc(scanUpdateChan)
 				if result.Total > 0 {
 					scanner.mu.Lock()
 					results[name] = result
 					totalSize += result.Total
+					totalFound += len(result.Items)
 					scanner.mu.Unlock()
 				}
-
-				atomic.AddInt32(&completed, 1)
 			}(sc.name, sc.fn)
 		}
 
 		wg.Wait()
+		close(scanUpdateChan)
 
 		return scanCompleteMsg{
 			results:   results,
@@ -1258,7 +1732,7 @@ func performClean(scanner *Scanner, category string) tea.Cmd {
 		// Remove from results
 		delete(scanner.Results, category)
 
-		return cleanCompleteMsg{freed: freed}
+		return cleanCompleteMsg{freed: freed, path: ""}
 	}
 }
 
@@ -1351,6 +1825,101 @@ func getSortedCategories(results map[string]*ScanResult) []string {
 	}
 	sort.Strings(categories)
 	return categories
+}
+
+// exploreDirectory loads the contents of a directory for detail view
+func exploreDirectory(m *Model, dirPath string) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		var items []FileItem
+		for _, entry := range entries {
+			path := filepath.Join(dirPath, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			size := info.Size()
+			if entry.IsDir() {
+				// Calculate directory size
+				dirSize, _ := calculateDirSize(path)
+				size = dirSize
+			}
+
+			items = append(items, FileItem{
+				Path:  path,
+				Name:  entry.Name(),
+				Size:  size,
+				IsDir: entry.IsDir(),
+			})
+		}
+
+		// Sort by size descending
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Size > items[j].Size
+		})
+
+		// Update model
+		m.detailItems = items
+		m.currentPath = append(m.currentPath, filepath.Base(dirPath))
+		m.detailChoice = 0
+		m.detailOffset = 0
+
+		return nil
+	}
+}
+
+// calculateDirSize recursively calculates the size of a directory
+func calculateDirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip files we can't access
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
+// performCleanItem cleans a single item from detail view
+func performCleanItem(scanner *Scanner, item FileItem) tea.Cmd {
+	return func() tea.Msg {
+		// First check if the item still exists
+		if _, err := os.Stat(item.Path); os.IsNotExist(err) {
+			// Item already deleted
+			return cleanCompleteMsg{freed: 0, path: item.Path}
+		}
+		
+		// Calculate actual size before deletion
+		var actualSize int64
+		if item.IsDir {
+			actualSize, _ = calculateDirSize(item.Path)
+		} else {
+			if info, err := os.Stat(item.Path); err == nil {
+				actualSize = info.Size()
+			}
+		}
+		
+		err := os.RemoveAll(item.Path)
+		if err != nil {
+			return errMsg{err}
+		}
+		
+		return cleanCompleteMsg{freed: actualSize, path: item.Path}
+	}
+}
+
+// Message type for updating detail items
+type detailUpdateMsg struct {
+	items []FileItem
+	path  []string
 }
 
 func main() {
