@@ -102,6 +102,8 @@ type Model struct {
 	scanningPaths   []string // Recently scanned paths
 	scanFoundItems  int      // Number of items found
 	scanTotalSize   int64    // Total size found so far
+	// Multi-selection fields
+	markedItems     map[string]bool // Track marked items by path
 }
 
 // Messages
@@ -123,6 +125,11 @@ type cleanCompleteMsg struct {
 	path  string // Path of the cleaned item
 }
 
+type batchCleanCompleteMsg struct {
+	freed int64
+	paths []string // Paths of the cleaned items
+}
+
 type diskUsageMsg struct {
 	table table.Model
 }
@@ -138,10 +145,11 @@ func initialModel() Model {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
 	return Model{
-		scanner:  NewScanner(),
-		state:    "menu",
-		spinner:  s,
-		progress: progress.New(progress.WithDefaultGradient()),
+		scanner:     NewScanner(),
+		state:       "menu",
+		spinner:     s,
+		progress:    progress.New(progress.WithDefaultGradient()),
+		markedItems: make(map[string]bool),
 	}
 }
 
@@ -214,6 +222,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.detailItems = m.results[category].Items
 						m.detailChoice = 0
 						m.detailOffset = 0
+						m.markedItems = make(map[string]bool) // Reset marked items
 						m.state = "detail"
 					}
 				}
@@ -309,11 +318,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == "detail" {
 				m.state = "results"
 				m.detailChoice = 0
+				m.markedItems = make(map[string]bool) // Reset marked items
 			} else if m.state == "results" || m.state == "cleaning" || m.state == "diskusage" {
 				m.state = "menu"
 				m.menuChoice = 0
 			}
 			
+		case " ": // Space key
+			// Toggle marking of selected item in detail view
+			if m.state == "detail" && m.detailChoice < len(m.detailItems) {
+				item := m.detailItems[m.detailChoice]
+				if m.markedItems[item.Path] {
+					delete(m.markedItems, item.Path)
+				} else {
+					m.markedItems[item.Path] = true
+				}
+			}
+
+		case "A": // Shift+A
+			// Mark all items in detail view
+			if m.state == "detail" {
+				for _, item := range m.detailItems {
+					m.markedItems[item.Path] = true
+				}
+			}
+
+		case "N": // Shift+N
+			// Unmark all items
+			if m.state == "detail" {
+				m.markedItems = make(map[string]bool)
+			}
+
+		case "D": // Shift+D
+			// Delete marked items
+			if m.state == "detail" && len(m.markedItems) > 0 {
+				m.state = "cleaning"
+				m.scanMessage = fmt.Sprintf("Cleaning %d marked items...", len(m.markedItems))
+				return m, performCleanMarkedItems(m.scanner, m.markedItems, m.detailItems)
+			}
+
 		case "c":
 			// Clean selected item in detail view
 			if m.state == "detail" && m.detailChoice < len(m.detailItems) {
@@ -363,6 +406,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.detailItems = newItems
 				
+				// Remove from marked items if it was marked
+				delete(m.markedItems, msg.path)
+				
 				// Adjust selection if needed
 				if m.detailChoice >= len(m.detailItems) && len(m.detailItems) > 0 {
 					m.detailChoice = len(m.detailItems) - 1
@@ -402,6 +448,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.totalSize -= msg.freed
 				m.state = "results"
 			}
+		}
+		return m, nil
+
+	case batchCleanCompleteMsg:
+		if m.state == "cleaning" {
+			// Remove all deleted items from the list
+			newItems := []FileItem{}
+			for _, item := range m.detailItems {
+				isDeleted := false
+				for _, deletedPath := range msg.paths {
+					if item.Path == deletedPath {
+						isDeleted = true
+						break
+					}
+				}
+				if !isDeleted {
+					newItems = append(newItems, item)
+				}
+			}
+			m.detailItems = newItems
+			
+			// Clear marked items for deleted paths
+			for _, deletedPath := range msg.paths {
+				delete(m.markedItems, deletedPath)
+			}
+			
+			// Adjust selection if needed
+			if m.detailChoice >= len(m.detailItems) && len(m.detailItems) > 0 {
+				m.detailChoice = len(m.detailItems) - 1
+			}
+			if m.detailChoice < 0 {
+				m.detailChoice = 0
+			}
+			
+			// Adjust scroll offset if needed
+			if m.detailOffset > 0 && m.detailChoice < m.detailOffset {
+				m.detailOffset = m.detailChoice
+			}
+			
+			// Update the total size in results
+			if m.currentCategory != "" {
+				if result, exists := m.results[m.currentCategory]; exists {
+					// Update the category's items list
+					newCategoryItems := []FileItem{}
+					for _, item := range result.Items {
+						isDeleted := false
+						for _, deletedPath := range msg.paths {
+							if item.Path == deletedPath {
+								isDeleted = true
+								break
+							}
+						}
+						if !isDeleted {
+							newCategoryItems = append(newCategoryItems, item)
+						}
+					}
+					result.Items = newCategoryItems
+					result.Total -= msg.freed
+				}
+			}
+			
+			m.totalSize -= msg.freed
+			m.state = "detail" // Return to detail view
+			
+			// Show success message
+			m.scanMessage = fmt.Sprintf("✅ Deleted %d items (%s)", len(msg.paths), humanize.Bytes(uint64(msg.freed)))
 		}
 		return m, nil
 
@@ -687,14 +799,21 @@ func (m Model) renderDetail() string {
 			style = selectedStyle
 		}
 
+		// Checkbox indicator
+		checkbox := "☐"
+		if m.markedItems[item.Path] {
+			checkbox = "☑️"
+		}
+
 		icon := "📄"
 		if item.IsDir {
 			icon = "📁"
 		}
 
-		// Adjust name width based on terminal width
-		nameWidth := min(50, m.width-30)
-		line := fmt.Sprintf("%s %-*s %10s",
+		// Adjust name width based on terminal width (accounting for checkbox)
+		nameWidth := min(45, m.width-35)
+		line := fmt.Sprintf("%s %s %-*s %10s",
+			checkbox,
 			icon,
 			nameWidth,
 			truncatePath(item.Name, nameWidth),
@@ -717,10 +836,27 @@ func (m Model) renderDetail() string {
 	}
 	s.WriteString("\n")
 	s.WriteString("  " + dimStyle.Render(fmt.Sprintf("Total: %s", humanize.Bytes(uint64(totalSize)))))
+
+	// Show marked items status
+	markedCount := len(m.markedItems)
+	if markedCount > 0 {
+		var markedSize int64
+		for path := range m.markedItems {
+			// Find the size of marked items
+			for _, item := range m.detailItems {
+				if item.Path == path {
+					markedSize += item.Size
+					break
+				}
+			}
+		}
+		s.WriteString(" • ")
+		s.WriteString(successStyle.Render(fmt.Sprintf("Marked: %d items (%s)", markedCount, humanize.Bytes(uint64(markedSize)))))
+	}
 	s.WriteString("\n\n")
 	
 	// Instructions
-	s.WriteString(dimStyle.Render("↑/↓ Navigate • PgUp/PgDn: Page • Enter: Open • Backspace: Up • c: Clean • ESC: Back"))
+	s.WriteString(dimStyle.Render("↑/↓ Navigate • Space: Mark • Shift+A: Mark All • Shift+N: Unmark All • Shift+D: Delete Marked • c: Clean • ESC: Back"))
 
 	return s.String()
 }
@@ -1913,6 +2049,48 @@ func performCleanItem(scanner *Scanner, item FileItem) tea.Cmd {
 		}
 		
 		return cleanCompleteMsg{freed: actualSize, path: item.Path}
+	}
+}
+
+// performCleanMarkedItems cleans all marked items
+func performCleanMarkedItems(scanner *Scanner, markedItems map[string]bool, allItems []FileItem) tea.Cmd {
+	return func() tea.Msg {
+		var totalFreed int64
+		cleanedPaths := []string{}
+		
+		for path := range markedItems {
+			// First check if the item still exists
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				continue // Skip if already deleted
+			}
+			
+			// Find the item in allItems to get size info
+			var item FileItem
+			for _, it := range allItems {
+				if it.Path == path {
+					item = it
+					break
+				}
+			}
+			
+			// Calculate actual size before deletion
+			var actualSize int64
+			if item.IsDir {
+				actualSize, _ = calculateDirSize(path)
+			} else {
+				if info, err := os.Stat(path); err == nil {
+					actualSize = info.Size()
+				}
+			}
+			
+			err := os.RemoveAll(path)
+			if err == nil {
+				totalFreed += actualSize
+				cleanedPaths = append(cleanedPaths, path)
+			}
+		}
+		
+		return batchCleanCompleteMsg{freed: totalFreed, paths: cleanedPaths}
 	}
 }
 
