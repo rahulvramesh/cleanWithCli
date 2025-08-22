@@ -120,6 +120,14 @@ type scanProgressMsg struct {
 	found   int
 }
 
+type cleanProgressMsg struct {
+	percent   float64
+	message   string
+	completed int
+	total     int
+	currentItem string
+}
+
 type cleanCompleteMsg struct {
 	freed int64
 	path  string // Path of the cleaned item
@@ -353,8 +361,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Delete marked items
 			if m.state == "detail" && len(m.markedItems) > 0 {
 				m.state = "cleaning"
-				m.scanMessage = fmt.Sprintf("Cleaning %d marked items...", len(m.markedItems))
-				return m, performCleanMarkedItems(m.scanner, m.markedItems, m.detailItems)
+				m.cleanProgress = 0.0
+				m.scanMessage = fmt.Sprintf("Starting to clean %d marked items...", len(m.markedItems))
+				return m, tea.Batch(
+					m.spinner.Tick,
+					cleanProgressTicker(),
+					performCleanMarkedItemsWithProgress(m.scanner, m.markedItems, m.detailItems),
+				)
 			}
 
 		case "c":
@@ -362,8 +375,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == "detail" && m.detailChoice < len(m.detailItems) {
 				item := m.detailItems[m.detailChoice]
 				m.state = "cleaning"
+				m.cleanProgress = 0.0
 				m.scanMessage = fmt.Sprintf("Cleaning %s...", item.Name)
-				return m, performCleanItem(m.scanner, item)
+				return m, tea.Batch(
+					m.spinner.Tick,
+					cleanProgressTicker(),
+					performCleanItemWithProgress(m.scanner, item),
+				)
 			}
 		}
 
@@ -383,6 +401,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.scanFoundItems = msg.found
 			m.scanTotalSize += msg.size
+		}
+		return m, nil
+
+	case cleanProgressMsg:
+		m.cleanProgress = msg.percent / 100.0
+		m.scanMessage = msg.message
+		// Continue the ticker if cleaning is still in progress
+		if cleaningInProgress {
+			return m, cleanProgressTicker()
 		}
 		return m, nil
 
@@ -525,6 +552,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.err = msg
 		return m, nil
+	
+	default:
+		// Handle nil messages from tickers
+		if msg == nil && cleaningInProgress {
+			return m, cleanProgressTicker()
+		}
 	}
 
 	return m, nil
@@ -2052,13 +2085,73 @@ func performCleanItem(scanner *Scanner, item FileItem) tea.Cmd {
 	}
 }
 
-// performCleanMarkedItems cleans all marked items
+// performCleanItemWithProgress cleans a single item with progress updates
+func performCleanItemWithProgress(scanner *Scanner, item FileItem) tea.Cmd {
+	return func() tea.Msg {
+		// Set up single item cleaning progress
+		cleaningInProgress = true
+		cleaningProgress = 0.0
+		cleaningMessage = fmt.Sprintf("Cleaning %s...", item.Name)
+		
+		// First check if the item still exists
+		if _, err := os.Stat(item.Path); os.IsNotExist(err) {
+			// Item already deleted
+			cleaningInProgress = false
+			return cleanCompleteMsg{freed: 0, path: item.Path}
+		}
+		
+		// Update progress to 25%
+		cleaningProgress = 0.25
+		cleaningMessage = fmt.Sprintf("Calculating size of %s...", item.Name)
+		
+		// Calculate actual size before deletion
+		var actualSize int64
+		if item.IsDir {
+			actualSize, _ = calculateDirSize(item.Path)
+		} else {
+			if info, err := os.Stat(item.Path); err == nil {
+				actualSize = info.Size()
+			}
+		}
+		
+		// Update progress to 50%
+		cleaningProgress = 0.50
+		cleaningMessage = fmt.Sprintf("Removing %s...", item.Name)
+		
+		// Small delay to show progress
+		time.Sleep(100 * time.Millisecond)
+		
+		// Update progress to 75%
+		cleaningProgress = 0.75
+		
+		err := os.RemoveAll(item.Path)
+		if err != nil {
+			cleaningInProgress = false
+			return errMsg{err}
+		}
+		
+		// Complete
+		cleaningInProgress = false
+		cleaningProgress = 1.0
+		cleaningMessage = fmt.Sprintf("Successfully cleaned %s", item.Name)
+		
+		return cleanCompleteMsg{freed: actualSize, path: item.Path}
+	}
+}
+
+// performCleanMarkedItems cleans all marked items with progress updates
 func performCleanMarkedItems(scanner *Scanner, markedItems map[string]bool, allItems []FileItem) tea.Cmd {
 	return func() tea.Msg {
 		var totalFreed int64
 		cleanedPaths := []string{}
 		
+		// Convert map to slice for predictable iteration
+		paths := make([]string, 0, len(markedItems))
 		for path := range markedItems {
+			paths = append(paths, path)
+		}
+		
+		for _, path := range paths {
 			// First check if the item still exists
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				continue // Skip if already deleted
@@ -2088,10 +2181,98 @@ func performCleanMarkedItems(scanner *Scanner, markedItems map[string]bool, allI
 				totalFreed += actualSize
 				cleanedPaths = append(cleanedPaths, path)
 			}
+			
 		}
 		
 		return batchCleanCompleteMsg{freed: totalFreed, paths: cleanedPaths}
 	}
+}
+
+// Global variables for tracking cleaning progress
+var (
+	cleaningProgress    float64
+	cleaningMessage     string
+	cleaningInProgress  bool
+)
+
+// performCleanMarkedItemsWithProgress cleans items with progress simulation
+func performCleanMarkedItemsWithProgress(scanner *Scanner, markedItems map[string]bool, allItems []FileItem) tea.Cmd {
+	return func() tea.Msg {
+		var totalFreed int64
+		cleanedPaths := []string{}
+		totalItems := len(markedItems)
+		
+		// Convert map to slice for predictable iteration
+		paths := make([]string, 0, len(markedItems))
+		for path := range markedItems {
+			paths = append(paths, path)
+		}
+		
+		// Mark cleaning as in progress
+		cleaningInProgress = true
+		cleaningProgress = 0.0
+		
+		for i, path := range paths {
+			// Update progress
+			progress := float64(i) / float64(totalItems)
+			cleaningProgress = progress
+			itemName := filepath.Base(path)
+			cleaningMessage = fmt.Sprintf("Cleaning %d/%d: %s", i+1, totalItems, itemName)
+			
+			// First check if the item still exists
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				continue // Skip if already deleted
+			}
+			
+			// Find the item in allItems to get size info
+			var item FileItem
+			for _, it := range allItems {
+				if it.Path == path {
+					item = it
+					break
+				}
+			}
+			
+			// Calculate actual size before deletion
+			var actualSize int64
+			if item.IsDir {
+				actualSize, _ = calculateDirSize(path)
+			} else {
+				if info, err := os.Stat(path); err == nil {
+					actualSize = info.Size()
+				}
+			}
+			
+			err := os.RemoveAll(path)
+			if err == nil {
+				totalFreed += actualSize
+				cleanedPaths = append(cleanedPaths, path)
+			}
+			
+			// Small delay to make progress visible (optional)
+			time.Sleep(50 * time.Millisecond)
+		}
+		
+		// Mark cleaning as complete
+		cleaningInProgress = false
+		cleaningProgress = 1.0
+		cleaningMessage = fmt.Sprintf("Completed cleaning %d items", totalItems)
+		
+		return batchCleanCompleteMsg{freed: totalFreed, paths: cleanedPaths}
+	}
+}
+
+// cleanProgressTicker sends periodic progress updates during cleaning
+func cleanProgressTicker() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		if cleaningInProgress {
+			return cleanProgressMsg{
+				percent: cleaningProgress * 100,
+				message: cleaningMessage,
+			}
+		}
+		return nil
+	})
 }
 
 // Message type for updating detail items
