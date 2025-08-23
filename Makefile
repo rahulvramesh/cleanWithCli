@@ -37,18 +37,18 @@ help:
 ## build: Build the application
 build:
 	@echo "$(YELLOW)Building $(BINARY_NAME)...$(NC)"
-	@go build $(LDFLAGS) -o $(BINARY_PATH) .
+	@go build $(LDFLAGS) -o $(BINARY_PATH) ./cmd/mac-cleaner
 	@echo "$(GREEN)✓ Built $(BINARY_PATH)$(NC)"
 
 ## run: Run the application
 run:
 	@echo "$(YELLOW)Running $(BINARY_NAME)...$(NC)"
-	@go run . 
+	@go run ./cmd/mac-cleaner 
 
 ## dev: Run the application in development mode (rebuild on changes)
 dev: build
 	@echo "$(YELLOW)Starting $(BINARY_NAME) in development mode...$(NC)"
-	@$(BINARY_PATH)
+	@./$(BINARY_NAME)
 
 ## test: Run tests
 test:

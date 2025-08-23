@@ -14,6 +14,32 @@ A terminal-based utility for cleaning up storage space on macOS systems. This to
 - **Parallel Processing**: Fast scanning using goroutines
 - **Safe Operations**: Only removes files that are safe to delete
 
+## 📁 Project Structure
+
+```
+cleanWithCli/
+├── cmd/mac-cleaner/          # Application entry point
+│   └── main.go              # Main function and program initialization
+├── internal/                 # Private application code
+│   ├── scanner/             # File scanning logic
+│   │   ├── scanner.go       # Core scanner struct and basic scanners
+│   │   ├── categories.go    # Category-specific scanners
+│   │   └── dev.go           # Development-specific scanners
+│   ├── ui/                  # Bubble Tea TUI components
+│   │   ├── model.go         # Application state model
+│   │   ├── views.go         # UI rendering functions
+│   │   ├── update.go        # Message handling and updates
+│   │   ├── commands.go      # Command functions and operations
+│   │   └── styles.go        # Lipgloss styles and themes
+│   ├── types/               # Data structures and types
+│   │   └── types.go         # FileItem, ScanResult, messages
+│   └── utils/               # Utility functions
+│       └── utils.go         # Helper functions for file operations
+├── Makefile                 # Build automation
+├── go.mod                   # Dependencies
+└── README.md                # Documentation
+```
+
 ### File Categories Scanned
 
 - **Cache Files**: System and application caches
